@@ -1,0 +1,152 @@
+/* Envio de e-mail sem dependências.
+   Escolha do provedor por variáveis de ambiente (a primeira que existir):
+     RESEND_API_KEY  -> https://resend.com   (API HTTPS)
+     BREVO_API_KEY   -> https://brevo.com    (API HTTPS)
+     SMTP_HOST (+ SMTP_PORT, SMTP_USER, SMTP_PASS) -> SMTP (465 = TLS direto, 587 = STARTTLS)
+   MAIL_FROM = remetente, ex.: ILHA ZERO <contato@seudominio.com>
+   Sem nada configurado, o e-mail NÃO é enviado e o conteúdo vai só para o log do servidor. */
+'use strict';
+const https = require('https'), net = require('net'), tls = require('tls'), crypto = require('crypto');
+
+const FROM = process.env.MAIL_FROM || '';
+const parseFrom = s => { const m = /^\s*(?:"?([^"<]*?)"?\s*)?<([^>]+)>\s*$/.exec(s); return m ? { name: (m[1] || '').trim(), email: m[2].trim() } : { name: '', email: String(s).trim() }; };
+
+function provider() {
+  if (!FROM) return null;
+  if (process.env.RESEND_API_KEY) return 'resend';
+  if (process.env.BREVO_API_KEY) return 'brevo';
+  if (process.env.SMTP_HOST) return 'smtp';
+  return null;
+}
+
+function httpsJson(host, pathname, headers, body) {
+  return new Promise((resolve, reject) => {
+    const data = Buffer.from(JSON.stringify(body));
+    const req = https.request({ host, path: pathname, method: 'POST', headers: Object.assign({ 'Content-Type': 'application/json', 'Content-Length': data.length }, headers), timeout: 15000 }, res => {
+      let out = ''; res.on('data', d => { out += d; if (out.length > 20000) res.destroy(); });
+      res.on('end', () => (res.statusCode >= 200 && res.statusCode < 300) ? resolve(out) : reject(new Error('HTTP ' + res.statusCode + ' ' + out.slice(0, 300))));
+    });
+    req.on('timeout', () => req.destroy(new Error('timeout')));
+    req.on('error', reject);
+    req.end(data);
+  });
+}
+
+const b64 = s => Buffer.from(s, 'utf8').toString('base64');
+const wrap76 = s => s.replace(/(.{76})/g, '$1\r\n');
+
+function buildMime({ from, to, subject, text, html }) {
+  const f = parseFrom(from), bnd = 'iz_' + crypto.randomBytes(12).toString('hex');
+  const hdr = [
+    'From: ' + (f.name ? '=?UTF-8?B?' + b64(f.name) + '?= ' : '') + '<' + f.email + '>',
+    'To: <' + to + '>',
+    'Subject: =?UTF-8?B?' + b64(subject) + '?=',
+    'Date: ' + new Date().toUTCString(),
+    'Message-ID: <' + crypto.randomBytes(12).toString('hex') + '@' + (f.email.split('@')[1] || 'ilhazero') + '>',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/alternative; boundary="' + bnd + '"'
+  ].join('\r\n');
+  const part = (type, body) => '--' + bnd + '\r\nContent-Type: ' + type + '; charset=utf-8\r\nContent-Transfer-Encoding: base64\r\n\r\n' + wrap76(b64(body)) + '\r\n';
+  return hdr + '\r\n\r\n' + part('text/plain', text) + part('text/html', html) + '--' + bnd + '--\r\n';
+}
+
+function smtpSend(o) {
+  return new Promise((resolve, reject) => {
+    const host = process.env.SMTP_HOST, port = parseInt(process.env.SMTP_PORT || '587', 10);
+    const user = process.env.SMTP_USER || '', pass = process.env.SMTP_PASS || '';
+    let sock, buf = '', ended = false; const waiters = [];
+    const fail = e => { if (ended) return; ended = true; clearTimeout(timer); try { sock && sock.destroy(); } catch (_) {} reject(e); };
+    const timer = setTimeout(() => fail(new Error('SMTP: tempo esgotado')), 25000);
+    const pump = () => {
+      for (;;) {
+        const m = /^(?:\d{3}-[^\n]*\n)*\d{3} [^\n]*\n/.exec(buf);
+        if (!m) return;
+        buf = buf.slice(m[0].length);
+        const w = waiters.shift(); if (w) w({ c: parseInt(m[0].slice(0, 3), 10), t: m[0] });
+      }
+    };
+    const attach = s => {
+      s.setEncoding('utf8');
+      s.on('data', d => { buf += d.replace(/\r/g, ''); pump(); });
+      s.on('error', fail);
+      s.on('close', () => fail(new Error('SMTP: conexão fechada')));
+    };
+    const reply = () => new Promise(r => waiters.push(r));
+    const cmd = async (line, ok) => {
+      sock.write(line + '\r\n');
+      const r = await reply();
+      if (!ok.includes(r.c)) throw new Error('SMTP ' + line.split(' ')[0] + ' -> ' + r.t.trim().slice(0, 200));
+      return r;
+    };
+    (async () => {
+      const secure = port === 465;
+      sock = secure ? tls.connect({ host, port, servername: host }) : net.connect(port, host);
+      attach(sock);
+      let r = await reply(); if (r.c !== 220) throw new Error('SMTP: saudação inesperada');
+      await cmd('EHLO ilhazero.local', [250]);
+      if (!secure && port !== 25) {
+        await cmd('STARTTLS', [220]);
+        sock.removeAllListeners('data'); sock.removeAllListeners('close'); sock.removeAllListeners('error'); sock.on('error', () => {});
+        buf = ''; sock = tls.connect({ socket: sock, servername: host }); attach(sock);
+        await new Promise((res, rej) => { sock.once('secureConnect', res); sock.once('error', rej); });
+        await cmd('EHLO ilhazero.local', [250]);
+      }
+      if (user) {
+        await cmd('AUTH LOGIN', [334]);
+        await cmd(b64(user), [334]);
+        await cmd(b64(pass), [235]);
+      }
+      await cmd('MAIL FROM:<' + parseFrom(o.from).email + '>', [250]);
+      await cmd('RCPT TO:<' + o.to + '>', [250, 251]);
+      await cmd('DATA', [354]);
+      sock.write(buildMime(o) + '\r\n.\r\n');
+      r = await reply(); if (r.c !== 250) throw new Error('SMTP DATA -> ' + r.t.trim().slice(0, 200));
+      try { sock.write('QUIT\r\n'); } catch (_) {}
+      ended = true; clearTimeout(timer); try { sock.end(); } catch (_) {}
+      resolve();
+    })().catch(fail);
+  });
+}
+
+/* Retorna true se enviou, false se não há provedor configurado. Lança erro se o provedor recusar. */
+async function sendMail({ to, subject, text, html }) {
+  const p = provider();
+  if (!p) { console.log('[mail] (sem provedor configurado) para ' + to + ' | ' + subject + '\n' + text); return false; }
+  if (p === 'resend') await httpsJson('api.resend.com', '/emails', { Authorization: 'Bearer ' + process.env.RESEND_API_KEY }, { from: FROM, to: [to], subject, html, text });
+  else if (p === 'brevo') { const f = parseFrom(FROM); await httpsJson('api.brevo.com', '/v3/smtp/email', { 'api-key': process.env.BREVO_API_KEY }, { sender: { name: f.name || 'ILHA ZERO', email: f.email }, to: [{ email: to }], subject, htmlContent: html, textContent: text }); }
+  else await smtpSend({ from: FROM, to, subject, text, html });
+  return true;
+}
+
+const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function welcomeMail(nick, code) {
+  const subject = 'Bem-vindo ao ILHA ZERO Battle Royale! Seu código de troca de nick';
+  const text = 'Bem-vindo ao ILHA ZERO Battle Royale, ' + nick + '!\n\n' +
+    'Use este código para resgatar o seu TROCA NICK:\n\n    ' + code + '\n\n' +
+    'No jogo: Ajustes > Trocar nick > digite o código e o novo nick.\n' +
+    'O código vale para uma única troca. Guarde-o e não compartilhe.\n\n' +
+    'Se não foi você que criou a conta, ignore este e-mail.';
+  const html = '<div style="background:#0c0f13;padding:24px;font-family:Arial,Helvetica,sans-serif;color:#e9efe6">' +
+    '<div style="max-width:480px;margin:0 auto;background:#141a17;border:1px solid #2a3530;border-radius:10px;padding:24px">' +
+    '<div style="color:#ffc82e;letter-spacing:3px;font-size:12px;text-transform:uppercase">Ilha Zero · Battle Royale</div>' +
+    '<h1 style="margin:8px 0 12px;font-size:24px;color:#fff">Bem-vindo, ' + esc(nick) + '!</h1>' +
+    '<p style="line-height:1.5;color:#c9d4cc;margin:0 0 16px">Use este código para resgatar o seu <b>TROCA NICK</b>:</p>' +
+    '<div style="background:#0c0f13;border:2px dashed #ffc82e;border-radius:8px;padding:16px;text-align:center;font-size:28px;font-weight:700;letter-spacing:4px;color:#ffc82e;font-family:Consolas,monospace">' + esc(code) + '</div>' +
+    '<p style="line-height:1.5;color:#c9d4cc;margin:16px 0 0">No jogo: <b>Ajustes → Trocar nick</b>, digite o código e o novo nick. O código vale para <b>uma única troca</b>. Guarde-o e não compartilhe.</p>' +
+    '<p style="line-height:1.5;color:#7d8a82;font-size:12px;margin:16px 0 0">Se não foi você que criou a conta, ignore este e-mail.</p>' +
+    '</div></div>';
+  return { subject, text, html };
+}
+
+function codeMail(nick, code) {
+  const subject = 'Seu código de troca de nick – ILHA ZERO';
+  const text = 'Olá, ' + nick + '!\n\nSeu código de TROCA NICK:\n\n    ' + code + '\n\nNo jogo: Ajustes > Trocar nick. Vale para uma única troca.';
+  const html = '<div style="background:#0c0f13;padding:24px;font-family:Arial,Helvetica,sans-serif;color:#e9efe6"><div style="max-width:480px;margin:0 auto;background:#141a17;border:1px solid #2a3530;border-radius:10px;padding:24px">' +
+    '<h1 style="margin:0 0 12px;font-size:22px;color:#fff">Olá, ' + esc(nick) + '!</h1><p style="color:#c9d4cc">Seu código de <b>TROCA NICK</b>:</p>' +
+    '<div style="background:#0c0f13;border:2px dashed #ffc82e;border-radius:8px;padding:16px;text-align:center;font-size:28px;font-weight:700;letter-spacing:4px;color:#ffc82e;font-family:Consolas,monospace">' + esc(code) + '</div>' +
+    '<p style="color:#c9d4cc">No jogo: <b>Ajustes → Trocar nick</b>. Vale para uma única troca.</p></div></div>';
+  return { subject, text, html };
+}
+
+module.exports = { sendMail, welcomeMail, codeMail, mailConfigured: () => !!provider() };
